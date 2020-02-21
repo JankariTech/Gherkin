@@ -39,6 +39,8 @@ class Parser
     private $tags = array();
     private $languageSpecifierLine;
 
+    private $passedNodesStack = array();
+
     /**
      * Initializes parser.
      *
@@ -236,6 +238,8 @@ class Parser
         $file = $this->file;
         $line = $token['line'];
 
+        array_push($this->passedNodesStack, 'Feature');
+
         // Parse description, background, scenarios & outlines
         while ('EOS' !== $this->predictTokenType()) {
             $node = $this->parseExpression();
@@ -256,6 +260,11 @@ class Parser
                 continue;
             }
 
+            if ($node instanceof ExampleTableNode) {
+                $background->addExample($node);
+                continue;
+            }
+
             if ($background instanceof BackgroundNode && $node instanceof BackgroundNode) {
                 throw new ParserException(sprintf(
                     'Each Feature could have only one Background, but found multiple on lines %d and %d%s',
@@ -272,6 +281,31 @@ class Parser
                     $node->getLine(),
                     $this->file ? ' in file: ' . $this->file : ''
                 ));
+            }
+        }
+
+        if ($background === null || !$background->hasExamples()) {
+            foreach ($scenarios as $scenario) {
+                if ($scenario instanceof OutlineNode && !$scenario->hasExamples()) {
+                    throw new ParserException(sprintf(
+                        'Outline should have examples table, but got none for outline "%s" on line: %d%s',
+                        rtrim($scenario->getTitle()),
+                        $scenario->getLine(),
+                        $this->file ? ' in file: ' . $this->file : ''
+                    ));
+                }
+            }
+        } else {
+            foreach ($scenarios as $scenario) {
+                if ($scenario instanceof OutlineNode && !$scenario->hasExamples()) {
+                    if (is_array($background->getExamples())) {
+                        foreach ($background->getExamples() as $ex) {
+                            $scenario->setExampleTable($ex);
+                        }
+                    } else {
+                        $scenario->setExampleTable($background->getExamples());
+                    }
+                }
             }
         }
 
@@ -302,6 +336,7 @@ class Parser
         $title = trim($token['value']);
         $keyword = $token['keyword'];
         $line = $token['line'];
+        $example = [];
 
         if (count($this->popTags())) {
             throw new ParserException(sprintf(
@@ -313,9 +348,14 @@ class Parser
 
         // Parse description and steps
         $steps = array();
-        $allowedTokenTypes = array('Step', 'Newline', 'Text', 'Comment');
+        $allowedTokenTypes = array('Step', 'Newline', 'Text', 'Comment', 'Examples');
         while (in_array($this->predictTokenType(), $allowedTokenTypes)) {
             $node = $this->parseExpression();
+
+            if ($node instanceof ExampleTableNode) {
+                $example[] = $node;
+                continue;
+            }
 
             if ($node instanceof StepNode) {
                 $steps[] = $this->normalizeStepNodeKeywordType($node, $steps);
@@ -350,7 +390,7 @@ class Parser
             }
         }
 
-        return new BackgroundNode(rtrim($title) ?: null, $steps, $keyword, $line);
+        return new BackgroundNode(rtrim($title) ?: null, $steps, $keyword, $line, $example);
     }
 
     /**
@@ -368,6 +408,8 @@ class Parser
         $tags = $this->popTags();
         $keyword = $token['keyword'];
         $line = $token['line'];
+
+        array_push($this->passedNodesStack, 'Scenario');
 
         // Parse description and steps
         $steps = array();
@@ -407,6 +449,8 @@ class Parser
             }
         }
 
+        array_pop($this->passedNodesStack);
+
         return new ScenarioNode(rtrim($title) ?: null, $tags, $steps, $keyword, $line);
     }
 
@@ -424,12 +468,17 @@ class Parser
         $title = trim($token['value']);
         $tags = $this->popTags();
         $keyword = $token['keyword'];
-        $examples = null;
+
+        /** @var ExampleTableNode $examples */
+        $examples = array();
         $line = $token['line'];
 
         // Parse description, steps and examples
         $steps = array();
-        while (in_array($this->predictTokenType(), array('Step', 'Examples', 'Newline', 'Text', 'Comment'))) {
+
+        array_push($this->passedNodesStack, 'Outline');
+
+        while (in_array($this->predictTokenType(), array('Step', 'Examples', 'Newline', 'Text', 'Comment', 'Tag'))) {
             $node = $this->parseExpression();
 
             if ($node instanceof StepNode) {
@@ -438,7 +487,8 @@ class Parser
             }
 
             if ($node instanceof ExampleTableNode) {
-                $examples = $node;
+                $examples[] = $node;
+
                 continue;
             }
 
@@ -470,15 +520,6 @@ class Parser
             }
         }
 
-        if (null === $examples) {
-            throw new ParserException(sprintf(
-                'Outline should have examples table, but got none for outline "%s" on line: %d%s',
-                rtrim($title),
-                $line,
-                $this->file ? ' in file: ' . $this->file : ''
-            ));
-        }
-
         return new OutlineNode(rtrim($title) ?: null, $tags, $steps, $examples, $keyword, $line);
     }
 
@@ -496,6 +537,8 @@ class Parser
         $text = trim($token['text']);
         $line = $token['line'];
 
+        array_push($this->passedNodesStack, 'Step');
+
         $arguments = array();
         while (in_array($predicted = $this->predictTokenType(), array('PyStringOp', 'TableRow', 'Newline', 'Comment'))) {
             if ('Comment' === $predicted || 'Newline' === $predicted) {
@@ -509,6 +552,8 @@ class Parser
                 $arguments[] = $node;
             }
         }
+
+        array_pop($this->passedNodesStack);
 
         return new StepNode($keyword, $text, $arguments, $line, $keywordType);
     }
@@ -524,7 +569,9 @@ class Parser
 
         $keyword = $token['keyword'];
 
-        return new ExampleTableNode($this->parseTableRows(), $keyword);
+        $tags = empty($this->tags) ? array() : $this->popTags();
+
+        return new ExampleTableNode($this->parseTableRows(), $keyword, $tags);
     }
 
     /**
@@ -570,7 +617,25 @@ class Parser
         $token = $this->expectTokenType('Tag');
         $this->tags = array_merge($this->tags, $token['tags']);
 
-        return $this->parseExpression();
+        $possibleTransitions = array(
+            'Outline' => array(
+                'Examples',
+                'Step'
+            )
+        );
+
+        $currentType = '-1';
+        // check if that is ok to go inside:
+        if (!empty($this->passedNodesStack)) {
+            $currentType = $this->passedNodesStack[count($this->passedNodesStack) - 1];
+        }
+
+        $nextType = $this->predictTokenType();
+        if (!isset($possibleTransitions[$currentType]) || in_array($nextType, $possibleTransitions[$currentType])) {
+            return $this->parseExpression();
+        }
+
+        return "\n";
     }
 
     /**
