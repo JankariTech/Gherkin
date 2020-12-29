@@ -1,0 +1,28 @@
+feature:
+  title:        Feature with example in the background
+  language:     en
+  line:         1
+  description:  ~
+
+  background:
+    line:       3
+    steps:
+      - { keyword_type: Given, type: Given, text: a passing step, line: 4 }
+    examples:
+      6: [login, password]
+      7: ['', '']
+      8: [unknown_user, 'known_pass']
+
+  scenarios:
+    -
+      type:     outline
+      title:    Scenario outline without example table
+      line:     10
+      steps:
+        - { keyword_type: 'Given', type: 'Given', text: 'I browse to the login page', line: 11 }
+        - { keyword_type: 'When',  type: 'When',   text: 'I fill in "login" with "<login>"',       line: 12 }
+        - { keyword_type: 'When',  type: 'And',    text: 'I fill in "password" with "<password>"', line: 13 }
+      examples:
+        6: [login, password]
+        7: ['', '']
+        8: [unknown_user, 'known_pass']
